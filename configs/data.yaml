@@ -1,0 +1,67 @@
+# 数据采集 / 股票池 / 切分 配置
+#
+# 这个文件是整个项目唯一的"事实来源"。加 Polymarket 因子时，
+# 只需改 universe.top_n_list 和 split.* 里的日期，不改代码。
+
+data:
+  start_date: "2010-01-01"
+  end_date: "2026-09-18"
+  symbol_list_path: "data/raw/symbols.parquet"  # 在市 ∪ 退市名单（缓存）
+  raw_symbol_dir: "data/raw/sina_by_symbol"     # 每股一个未复权 parquet（下载缓存，可续传）
+  panel_path: "data/raw/panel.parquet"          # 合并 + 复权后的全量面板
+  per_symbol_dir: "data/raw/by_symbol"          # 每股一个复权 parquet，喂给 dump_bin
+  qlib_dir: "data/qlib_cn"                      # qlib 二进制数据目录
+
+# 主数据源为新浪财经。为什么不是 tushare：本机 token（120 积分档）实测
+# `daily` 与 `bak_daily` 均无访问权限，`daily_basic`/`stock_basic`/`adj_factor`
+# 虽可访问但配额是 **1 次/小时**，无法批量。详见
+# `src/pmsp/datasource/sina_daily.py` 的模块文档。
+source:
+  name: sina
+  rate_limit_per_min: 40        # = 最小间隔 1.5s。实测 0.5s 间隔会触发 HTTP 456
+  max_retries: 4
+  retry_backoff: 2.0            # 指数退避基数（秒），用于网络异常/5xx
+  # HTTP 456 = 新浪限流，封的是 IP 而非单个请求。实测触发后约 273s 内所有请求
+  # 一律 456，所以冷却设 330s（留余量），且不计入 max_retries。
+  throttle_cooldown: 330.0
+  max_throttles: 4
+
+  # 新浪不提供成交额，由此产生两处已知偏差（都记在报告里）：
+  #   1. amount_yuan 用 close × volume 代理（真实值是 vwap × volume）
+  #   2. $vwap 不可得 → Alpha158 的 VWAP0 因子去掉，因子数 216 → 215
+  has_amount: false
+
+universe:
+  rebalance: month_end          # 每月最后一个交易日调整
+  lookback_days: 60             # 按过去 60 个交易日的日均成交额排名
+  min_listed_days: 250          # 剔除上市不足 250 交易日的次新
+  top_n_list: [1500, 300]       # 预注册：1500 为主检验，300 为第二窗口
+
+label:
+  horizon: 5
+  # T+1 收盘买、T+6 收盘卖。不用 Ref($close,-5)/$close-1——那是 T 日收盘
+  # 算因子、T 日收盘成交，实盘不可执行，会系统性高估。
+  expr: "Ref($close, -6)/Ref($close, -1) - 1"
+  transform: CSZScoreNorm       # 或 CSRankNorm（优化 RankIC 时用）
+
+split:
+  embargo_days: 5               # 5 日标签重叠 → 训练段末尾切掉 5 天
+
+  # (a) baseline 自身质量评估：长窗口，统计功效充足
+  baseline:
+    oos_start: "2018-01-01"
+    retrain_freq_months: 6
+
+  # (b) Polymarket 对比：锁死窗口，绝不用于调参
+  #     两个模型必须在完全相同的 OOS 天数上评估（配对 IC 差值检验的前提）
+  pm_compare:
+    warmup_start: "2024-01-01"  # PM 层预热首训（覆盖美国大选，PM 数据最厚）
+    oos_start: "2025-01-01"
+    oos_end: "2026-09-18"
+    retrain_freq_months: 1
+
+cost:
+  # A 股实际费率
+  commission_bps: 2.5           # 佣金 万2.5，双边
+  stamp_duty_bps: 10.0          # 印花税 千1，仅卖出
+  impact_bps: 10.0              # 冲击成本估计，单边

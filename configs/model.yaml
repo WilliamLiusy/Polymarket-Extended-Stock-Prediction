@@ -1,0 +1,61 @@
+# 因子 / 模型 / walk-forward 配置
+#
+# 与方案的一处偏离，说明清楚：方案里写的是 configs/workflow_lgb_alpha158.yaml
+# 加 configs/workflow_ridge_alpha158.yaml 两份 **qlib qrun 格式**的 workflow。
+# 实际没那么做，原因是 qrun 的 yaml 只能描述**一次固定切分**的实验，
+# 而我们要的是"每窗口重新 fit 特征标准化统计量"的滚动重训——
+# 这在 qrun 的 DataHandlerLP 里表达不出来（processor 的 fit_start/fit_end 是写死的）。
+# qlib 自带的 qlib.contrib.rolling 能滚动，但绑定了它的 task management + MongoDB。
+# 所以滚动逻辑用 src/pmsp/model/walkforward.py 自己实现，两个模型合成这一份配置
+# （避免两份 90% 重复的 yaml）。Alpha158 因子、标签口径、CSZScoreNorm 仍然全部用 qlib 的。
+
+features:
+  # Alpha158 的 rolling 窗口。默认 [5,10,20,30,60] = 158 个因子；
+  # 扩到 7 个窗口 = 215 个因子，即方案要求的"两百多个"。
+  # （方案写的是 216——去掉 VWAP0 后是 215，因为新浪源没有成交额、
+  #   算不出 $vwap。见 pmsp.build.to_qlib.QLIB_FIELDS。）
+  # 每增删一个窗口，因子数变化 29 个。
+  windows: [3, 5, 10, 20, 30, 60, 120]
+  # 特征标准化：MAD 版 z-score + 截尾。统计量**只在每个窗口的训练段上 fit**。
+  robust_zscore_clip: 3.0
+
+walkforward:
+  valid_days: 240          # 验证集长度（交易日），≈1 年，仅用于早停/选正则
+  min_train_days: 500      # 训练集不足这么多交易日则跳过该窗口
+  train_start: null        # null = 扩张窗口，从数据起点开始
+                           # 设成具体日期即做方案里的"匹配样本对照"
+
+models:
+  lgb:
+    # 前 7 项照抄 qlib 自带参考配置 qlib/tests/config.py:GBDT_MODEL
+    # （colsample_bytree / subsample 即 feature_fraction / bagging_fraction）
+    objective: mse
+    learning_rate: 0.0421
+    lambda_l1: 205.6999
+    lambda_l2: 580.9768
+    max_depth: 8
+    num_leaves: 210
+    feature_fraction: 0.8879
+    bagging_fraction: 0.8789
+    # 下面两项是我们补的：qlib 那份配置没有 bagging_freq，而 LightGBM 在
+    # bagging_freq=0 时 bagging_fraction 根本不生效（等于空转）。
+    bagging_freq: 5
+    min_data_in_leaf: 100
+    num_threads: 40
+    verbose: -1
+    seed: 0
+    num_boost_round: 1000
+    early_stopping_rounds: 50   # 早停看**验证集日度 IC**，不看 MSE
+
+  ridge:
+    # 线性下限对照。正则强度按验证集 IC 选，不按 MSE/R²。
+    alphas: [1.0, 10.0, 100.0, 1000.0, 10000.0]
+
+eval:
+  n_groups: 10             # 分层回测组数
+  cost_multipliers: [0.0, 0.5, 1.0, 2.0]   # 成本敏感性：看多空 Sharpe 何时归零
+
+output:
+  pred_dir: "data/predictions"   # 逐日预测 + 日度 IC 序列存档（PM 配对检验直接读）
+  report_dir: "reports"
+  cache_dir: "data/features"     # 特征矩阵缓存

@@ -1,0 +1,26 @@
+# 数据与产物 —— 全部可由 scripts/01..04 重新生成，不进仓库
+#
+# data/raw/sina_by_symbol/  每股一个未复权 parquet，全市场约 5800 个文件、数百 MB
+# data/raw/panel.parquet    合并复权后的全量面板
+# data/qlib_cn/             qlib 二进制库
+# data/features/            特征矩阵缓存（215 因子 × 全市场 × 16 年）
+# data/predictions/         walk-forward 的样本外预测与日度 IC 序列
+# data/reports/             生成的 markdown 报告
+data/
+
+# 环境与缓存
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+.venv/
+venv/
+.env
+
+# 编辑器
+.idea/
+.vscode/
+*.swp
+
+# 凭证 —— tushare token 之类绝不进仓库
+*.token
+.tushare.csv
