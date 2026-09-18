@@ -3,18 +3,37 @@
 ## 为什么要走"伪 instrument"这条路
 
 Polymarket 的市场都是**全市场级别的宏观事件**（降息概率、大选、关税）。
-一个宏观概率序列在任一天对所有股票都是同一个数，横截面标准化之后**恒等于零**，
-对 IC 的贡献严格为 0。所以不能直接当因子塞进去。
+一个宏观概率序列 `P_t` 在任一天对**所有股票都是同一个数**，而我们的评估口径
+是「固定 t 日、跨股票算 corr(预测, 实际收益)」。这带来一个必须分清的区别：
 
-有意义的用法是「**外部时序 × 个股暴露度**」的交叉因子：个股收益对该宏观序列
-的滚动 beta / 相关性，这个量是**因股而异**的，才有横截面区分度。
+* 对 **Ridge** 之类对该列**线性可加**的模型，预测里多出的 `c·P_t` 对当天所有
+  股票是同一个常数，等于把所有分数**整体平移**；相关系数对平移不变，所以
+  截面 IC 贡献**恰为 0**。这是可证明的，不是实测结论。
+* 对 **LightGBM**，树可以**先在 `P_t` 上分裂、再在个股因子上分裂**，等价于
+  「不同宏观状态下给因子不同权重」，这会改变股票之间的排序，**能贡献 IC**。
+  但 `P_t` 一天只有一个值，在它上面分裂是在切分**日期**而非股票；Polymarket
+  可用区间约 450 个交易日 ≈ 90 个独立 5 日区间，很容易记住"2024 年 11 月那
+  几周"而非学到真实的状态效应。所以它是**对照变体**，不作主路径。
+
+主路径是「**外部时序 × 个股暴露度**」的交叉因子——同一个宏观事件对不同股票
+影响本来就不同（外向型制造业对关税概率敏感，本地公用事业接近 0），这个
+敏感度**因股而异**，才有横截面区分度。两种形式：
+
+    暴露度   beta_i   —— 个股收益对 Δ概率 的滚动回归斜率／相关系数
+    冲击     beta_i × Δp_t —— 再乘上当日概率变动，**带方向**
+
+`beta_i` 只说"这只股票对降息敏感"，没说今天该往哪个方向交易；乘上 `Δp_t`
+之后才有方向——概率跌了，高 beta 股该跌。所以 `shock` 比 `corr` 锋利。
 
 qlib 的 `ChangeInstrument` 算子原生支持在表达式里引用另一个 instrument，
-所以只要把外部序列注册成一个 instrument，暴露度因子就是一行表达式，
+所以只要把外部序列注册成一个 instrument，这些因子就是一行表达式，
 **不需要改 qlib 一行代码**：
 
     Corr($close/Ref($close,1)-1,
-         ChangeInstrument("PM_FED_CUT", $close/Ref($close,1)-1), 60)
+         ChangeInstrument("PM_FED_CUT", $close-Ref($close,1)), 60)
+
+（外部一侧用**绝对差**而非相对变化：概率 0.02→0.04 相对变化 +100%，实际只是
+2 个百分点的消息量。见 `exposure_expr` 的文档。）
 
 ## 两个必须守住的约束
 
@@ -136,17 +155,36 @@ def write_external_instrument(
 def exposure_expr(name: str, window: int = 60, kind: str = "corr") -> str:
     """生成「个股 vs 外部序列」的暴露度因子表达式。
 
+    ## 外部序列用绝对变化，不用相对变化
+
+    个股一侧用收益率 `$close/Ref($close,1)-1` 是对的，但外部一侧是**概率**，
+    必须用绝对差 `$close-Ref($close,1)`（单位：百分点）。概率从 0.02 涨到
+    0.04，相对变化 +100%，可实际只是 2 个百分点的消息量；用相对变化会让
+    低概率市场的日常抖动完全支配整个序列。
+
     Parameters
     ----------
     name : str
         伪 instrument 名。
     window : int
         滚动窗口（交易日）。
-    kind : {"corr", "beta", "level"}
+    kind : {"corr", "beta", "shock", "level"}
         * `corr`  —— 滚动相关系数。无量纲、天然有界，横截面可比性最好，**推荐默认**。
-        * `beta`  —— 滚动回归斜率。有量纲（受个股波动率影响），需另做标准化。
-        * `level` —— 外部序列本身。**横截面上是常数，IC 贡献恒为 0**，
-          仅用于对照实验，证明"直接塞宏观序列没用"。
+        * `beta`  —— 滚动回归斜率：`Δ个股收益 / Δ概率`。有量纲（受个股波动率
+          影响），需另做标准化，但可解释性强。
+        * `shock` —— **暴露度 × 当日概率变动**，即 `beta × Δp_t`。这是四个里
+          最锋利的：`corr`/`beta` 只说"这只股票对降息敏感"，没说今天该往哪个
+          方向交易；`shock` 同时带了方向——概率跌了，高 beta 股该跌。既有横
+          截面变化（beta 因股而异），又随消息翻转符号。
+        * `level` —— 外部序列本身。**横截面上是常数**，仅用于对照实验。
+          注意它"没用"的说法要分模型看：对 Ridge 之类**对该列线性可加**的模型，
+          预测里多出的 `c·P_t` 对当天所有股票是同一个常数，等于整体平移，
+          而相关系数对平移不变 —— 截面 IC 贡献**恰为 0**，可证明。
+          但 LightGBM 可以**先在 P_t 上分裂、再在个股因子上分裂**，等价于在
+          不同宏观状态下给因子不同权重，这会改变股票排序、**能贡献 IC**。
+          代价是 P_t 一天只有一个值，在它上面分裂是在切分**日期**而非股票，
+          450 个交易日 ≈ 90 个独立 5 日区间，很容易记住某几周而非学到状态效应。
+          所以 `level` 该作为对照变体跑，不作主路径。
 
     Returns
     -------
@@ -154,21 +192,23 @@ def exposure_expr(name: str, window: int = 60, kind: str = "corr") -> str:
         可直接放进 qlib 表达式列表的字符串。
     """
     stock_ret = "$close/Ref($close,1)-1"
-    ext_ret = f'ChangeInstrument("{name}", $close/Ref($close,1)-1)'
+    ext_chg = f'ChangeInstrument("{name}", $close-Ref($close,1))'
+    beta = (f"Corr({stock_ret},{ext_chg},{window})"
+            f"*Std({stock_ret},{window})/Std({ext_chg},{window})")
     if kind == "corr":
-        return f"Corr({stock_ret},{ext_ret},{window})"
+        return f"Corr({stock_ret},{ext_chg},{window})"
     if kind == "beta":
         # Cov/Var；qlib 没有 Cov 算子，用 Corr×Std 比展开
-        return (
-            f"Corr({stock_ret},{ext_ret},{window})"
-            f"*Std({stock_ret},{window})/Std({ext_ret},{window})"
-        )
+        return beta
+    if kind == "shock":
+        return f"({beta})*{ext_chg}"
     if kind == "level":
         return f'ChangeInstrument("{name}", $close)'
-    raise ValueError(f"kind 只能是 corr/beta/level，收到 {kind!r}")
+    raise ValueError(f"kind 只能是 corr/beta/shock/level，收到 {kind!r}")
 
 
-def pm_feature_config(names: list[str], windows=(20, 60), kinds=("corr",)) -> tuple[list, list]:
+def pm_feature_config(names: list[str], windows=(20, 60),
+                      kinds=("corr", "shock")) -> tuple[list, list]:
     """批量生成 Polymarket 暴露度因子的 (fields, names)，格式同 `Alpha158DL`。
 
     直接和 Alpha158 的输出相加即可：

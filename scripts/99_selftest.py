@@ -442,11 +442,11 @@ def test_external_series(panel: pd.DataFrame, qlib_dir: Path, workdir: Path) -> 
 
     qlib.init(provider_uri=str(qlib_dir), region="cn", expression_cache=None, dataset_cache=None)
     codes = list(D.list_instruments(D.instruments("top50"), as_list=True))[:30]
-    corr_expr = exposure_expr("PM_TEST_EVENT", 60, "corr")
-    level_expr = exposure_expr("PM_TEST_EVENT", 60, "level")
-    got = D.features(codes, [corr_expr, level_expr],
+    exprs = {k: exposure_expr("PM_TEST_EVENT", 60, k)
+             for k in ("corr", "beta", "shock", "level")}
+    got = D.features(codes, list(exprs.values()),
                      start_time=str(calendar[800].date()), end_time=str(calendar[-30].date()))
-    got.columns = ["corr", "level"]
+    got.columns = list(exprs)
     if list(got.index.names) == ["instrument", "datetime"]:
         got = got.swaplevel(0, 1).sort_index()
 
@@ -459,10 +459,36 @@ def test_external_series(panel: pd.DataFrame, qlib_dir: Path, workdir: Path) -> 
     check("暴露度因子有横截面区分度（这才是它有用的前提）",
           cs_std > 0.05, f"日均横截面标准差 {cs_std:.4f}")
 
+    # shock = beta × Δp：既要有横截面区分度，又要**随消息翻转符号**。
+    # 只有 beta 的话，因子在整个样本里符号基本不变，等于一个静态的行业哑变量。
+    sh = got["shock"].dropna()
+    sh_cs_std = got["shock"].groupby(level="datetime").std().mean()
+    sh_daily_mean = got["shock"].groupby(level="datetime").mean().dropna()
+    flip = float(((sh_daily_mean > 0).astype(int).diff().abs() > 0).mean())
+    check("shock 因子（beta×Δp）有横截面区分度且符号会随消息翻转",
+          bool(sh_cs_std > 0 and len(sh) > 1000 and flip > 0.05),
+          f"日均横截面标准差 {sh_cs_std:.2e}，日均值符号翻转频率 {flip:.1%}")
+
     lvl_std = got["level"].groupby(level="datetime").std().mean()
-    check("对照：宏观序列本身横截面标准差 ≈ 0（直接当因子 IC 贡献恒为零）",
+    check("对照：宏观序列本身横截面标准差 ≈ 0（每天对所有股票同一个数）",
           lvl_std < 1e-9,
-          f"日均横截面标准差 {lvl_std:.2e} —— 所以必须做成「外部时序 × 个股暴露度」")
+          f"日均横截面标准差 {lvl_std:.2e}")
+
+    # 这条才是"直接塞原始概率对 IC 贡献为零"的**证明**，而且划清了适用边界：
+    # 它证的是"对预测加一个每日常数，当日 IC 一点不变"。所以对 Ridge 之类
+    # 对该列线性可加的模型，贡献恰为 0；但 LightGBM 能在 P_t 上分裂、再在个股
+    # 因子上分裂（= 宏观状态 × 个股因子的交互），那不是加常数，故可以不为 0。
+    lvl = got["level"].groupby(level="datetime").transform("first")
+    base = pd.Series(np.random.default_rng(7).standard_normal(len(got)), index=got.index)
+    lab = base * 0.3 + pd.Series(
+        np.random.default_rng(8).standard_normal(len(got)), index=got.index)
+    ic_a, _ = calc_ic_series(base, lab)
+    ic_b, _ = calc_ic_series(base + 100.0 * lvl, lab)   # 加一个每日常数
+    d = (ic_a - ic_b).abs().max()
+    check("给预测加上任意每日常数后，当日 IC 逐日完全不变（线性可加时贡献恰为 0）",
+          bool(np.isfinite(d) and d < 1e-9),
+          f"{len(ic_a)} 天，最大 IC 变化 {d:.2e} —— 相关系数对平移不变；"
+          f"LightGBM 靠交互仍可能有贡献，那不是加常数")
 
 
 def main() -> int:

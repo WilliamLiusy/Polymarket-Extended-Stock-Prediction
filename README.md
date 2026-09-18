@@ -18,7 +18,7 @@ Polymarket 因子的接入点已经建好并验证通过（见下方"Polymarket 
 conda create -n pmsp python=3.12 -y && conda activate pmsp
 pip install -r requirements.txt
 
-# 0. 不需要 token、不碰网络，先确认整条链路是通的（约 1 分钟，47 项检查）
+# 0. 不需要 token、不碰网络，先确认整条链路是通的（约 1 分钟，49 项检查）
 python scripts/99_selftest.py
 
 # 1. 数据（**不需要任何 token / 账号**，主数据源是新浪财经的公开接口）
@@ -102,12 +102,24 @@ scripts/99_selftest.py  合成数据端到端自测（不需要 token）
 
 ## Polymarket 怎么接进来
 
-**先说一个容易踩的坑**：Polymarket 的市场都是全球宏观事件（降息、大选、关税）。
-一个宏观概率序列在任一天对所有股票都是同一个数，**横截面标准化之后恒等于零**，
-直接当因子塞进去对 IC 的贡献严格为 0。自测第 8 节把这一点验证出来了
-（宏观序列本身的日均横截面标准差 = 0.00e+00）。
+评估口径是**固定日期的横截面**：给定 t 日，跨股票算 `corr(预测, 实际 5 日收益)`。
+Polymarket 的市场都是全球宏观事件（降息、大选、关税），一个概率序列 `P_t`
+在 t 日对**所有股票都是同一个数**。同一个宏观事件对不同股票影响当然不同——
+外向型制造业对关税概率敏感，本地公用事业接近 0——**但那个"不同"藏在个股的
+敏感度里，不在 `P_t` 本身**。所以怎么编码很要紧：
 
-有意义的用法是「**外部时序 × 个股暴露度**」的交叉因子：
+| 编码方式 | 截面 IC 贡献 |
+|---|---|
+| 原始概率 `P_t` + **Ridge**（对该列线性可加） | **恰为 0，可证明**。预测里多出的 `c·P_t` 对当天所有股票是同一个常数，等于整体平移；相关系数对平移不变 |
+| 原始概率 `P_t` + **LightGBM** | **可以不为 0**。树能先在 `P_t` 上分裂、再在个股因子上分裂 = 不同宏观状态下给因子不同权重，这会改变股票排序 |
+| 暴露度 `beta_i` = 个股收益对 `Δp` 的滚动相关/斜率 | 因股而异，有横截面区分度（自测实测日均横截面标准差 0.1161） |
+| 冲击 `beta_i × Δp_t` | 同上，且**带方向**——概率跌了，高 beta 股该跌 |
+
+`P_t` + LightGBM 这条**能用但要当对照变体**，不作主路径：`P_t` 一天只有一个值，
+在它上面分裂是在切分**日期**而非股票，而 Polymarket 可用区间只有约 450 个交易日
+≈ 90 个独立 5 日区间，树很容易记住"2024 年 11 月那几周"而不是学到真实的状态效应。
+
+主路径是后两行的交叉因子：
 
 ```python
 from pmsp.extensions.external_series import read_calendar, write_external_instrument, pm_feature_config
@@ -117,11 +129,17 @@ cal = read_calendar("data/qlib_cn")
 write_external_instrument("PM_FED_CUT", fed_cut_prob_series, "data/raw/by_symbol", cal)
 dump_to_qlib("data/raw/by_symbol", "data/qlib_cn")     # 注册成伪 instrument
 
-fields, names = pm_feature_config(["PM_FED_CUT"], windows=(20, 60))
-# -> Corr($close/Ref($close,1)-1, ChangeInstrument("PM_FED_CUT", $close/Ref($close,1)-1), 60)
+fields, names = pm_feature_config(["PM_FED_CUT"], windows=(20, 60), kinds=("corr", "shock"))
+# corr  -> Corr($close/Ref($close,1)-1, ChangeInstrument("PM_FED_CUT", $close-Ref($close,1)), 60)
+# shock -> (上面那个 beta) * ChangeInstrument("PM_FED_CUT", $close-Ref($close,1))
 ```
 再把 `fields/names` 传给 `build_feature_matrix(extra_fields=..., extra_names=...)`，
-下游代码完全不用改。
+下游代码完全不用改。`kinds` 里还有 `beta`（滚动回归斜率）和 `level`（原始概率，
+即上表第一/二行的对照变体）。
+
+外部序列一侧用**绝对差** `$close-Ref($close,1)`（百分点）而不是相对变化：
+概率从 0.02 涨到 0.04 相对变化是 +100%，实际只是 2 个百分点的消息量，
+用相对变化会让低概率市场的日常抖动支配整个序列。
 
 外部序列会先对齐到 A 股交易日历，**只向后填充**（Polymarket 7×24 交易、A 股周末休市，
 用 bfill 或插值就是把未来信息搬到过去），并且超过 `max_stale_days` 没有新报价就置 NaN，
