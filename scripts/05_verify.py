@@ -398,14 +398,39 @@ def verify_benchmark(cfg, mcfg, model: str = "lgb") -> None:
 
 # ------------------------------------------------------ 5. embargo 有效性
 def verify_embargo(cfg, mcfg, universe: str) -> None:
-    """去掉 embargo 重跑，**验证集** IC 应明显虚高——反证 embargo 起了作用。
+    """embargo 是否真的隔断了 5 日标签的收益区间重叠。
 
-    注意看的是验证集 IC 而不是测试集 IC：embargo 的作用是防止早停偷看，
-    症状就出现在验证集分数上。
+    ## 为什么不是「去掉 embargo，验证集 IC 应虚高」的 A/B
+
+    那个 A/B 在数量级上就检不出东西。实测 embargo=5 → 验证集 IC 0.0770、
+    embargo=0 → 0.0762（反向 −1.0%），按「0 天必须更高」判就是失败；但失败的是
+    检验本身，不是切分。算一下就知道：
+
+    标签 `Ref($close,-6)/Ref($close,-1)-1` 在 T 日吃掉 T+2..T+6 这 5 个交易日的
+    日收益。embargo=0 时 `train_end = valid_start-1`，valid 最前面 4 天的收益区间
+    与 train 末尾标签分别重叠 4/3/2/1 天，被污染的权重只有
+    `(4+3+2+1)/(5×240) ≈ 0.8%`。哪怕这 0.8% 从 OOS 的 0.077 一路虚高到样本内
+    水平（~0.15），对 240 天均值的贡献也只有 ~+0.0006；而训练集末尾动 5 天会重排
+    LightGBM 的全部分箱与树结构，run-to-run 扰动本身就有 ~0.001 量级。信号比噪声
+    小，这个 A/B 判通过还是失败基本靠运气——留着只会制造假警报。
+
+    所以拆成两项：
+
+    * **[结构]** 直接在真实切分上验收「收益区间不重叠」——这就是要保证的性质
+      本身，纯交易日算术，零噪声、零训练成本。两段标签 T1<T2 的收益区间不重叠的
+      充要条件是 `T2-T1 >= horizon`（T1 占 T1+2..T1+horizon+1，T2 占
+      T2+2..T2+horizon+1）；`embargo=E` 给出的间隔是 `E+1`，故必要条件为
+      **E >= horizon-1 = 4**。配置取 5，留 1 天余量。
+    * **[灵敏度]** 把 `train_end` 推进 valid 内部 60 天，验证集 IC 必须明显虚高。
+      这证明验证集 IC 确实是留出测量、污染确实会从这里冒出来——用足够大的污染量
+      换检验功效，而不是去测一个低于噪声的量。
+
+    两项合起来才是原意：结构那项保证「该隔断的隔断了」，灵敏度那项保证「万一没
+    隔断，这个指标看得见」。
     """
-    print("\n[5] embargo 有效性（去掉 embargo，验证集 IC 应虚高）")
+    print("\n[5] embargo 有效性（结构上不重叠 + 验证集 IC 对污染敏感）")
     from pmsp.model.dataset import build_feature_matrix
-    from pmsp.model.walkforward import generate_splits, run_walkforward
+    from pmsp.model.walkforward import Split, generate_splits, run_walkforward
 
     df, feat_cols = build_feature_matrix(
         qlib_dir=cfg.path("data.qlib_dir"), universe=universe,
@@ -414,25 +439,70 @@ def verify_embargo(cfg, mcfg, universe: str) -> None:
         windows=mcfg.features["windows"], cache_dir=abs_path(mcfg.output["cache_dir"]),
     )
     dates = pd.DatetimeIndex(df.index.get_level_values("datetime").unique()).sort_values()
+    horizon = int(cfg.label["horizon"])
+    emb = int(cfg.split["embargo_days"])
+    wf = mcfg.walkforward
+
+    # ---- 5a 结构：**线上真实用的**那批切分，两处间隔都必须 >= horizon
+    gaps = []
+    for name in ("baseline", "pm_compare"):
+        sc = cfg.split[name]
+        for sp in generate_splits(
+            dates, oos_start=sc["oos_start"],
+            oos_end=sc.get("oos_end", cfg.data["end_date"]),
+            retrain_months=sc["retrain_freq_months"], embargo_days=emb,
+            valid_days=wf["valid_days"], min_train_days=wf["min_train_days"],
+            train_start=wf["train_start"],
+        ):
+            p = dates.get_indexer([sp.train_end, sp.valid_start, sp.valid_end, sp.test_start])
+            gaps.append((int(p[1] - p[0]), int(p[3] - p[2])))
+
+    min_tv = min(g[0] for g in gaps)
+    min_vt = min(g[1] for g in gaps)
+    check(
+        f"train/valid 与 valid/test 的标签收益区间不重叠（间隔 >= horizon={horizon}）",
+        min_tv >= horizon and min_vt >= horizon,
+        f"{len(gaps)} 个真实窗口：train→valid 最小间隔 {min_tv} 个交易日、"
+        f"valid→test 最小间隔 {min_vt}；embargo={emb} → 间隔 {emb + 1}，"
+        f"必要条件 {horizon}，余量 {min(min_tv, min_vt) - horizon} 天",
+    )
+
+    # ---- 5b 灵敏度：把 train_end 推进 valid 内部，验证集 IC 必须明显虚高。
+    # 用 60 天（占 valid 的 1/4）而不是 embargo 那 5 天，是为了让效应量远离噪声；
+    # 这里要证的是「指标对污染敏感」，不是「5 天污染有多大」。
+    contam = 60
+    base = generate_splits(dates, "2022-01-01", "2024-01-01", retrain_months=12,
+                           embargo_days=emb, valid_days=wf["valid_days"],
+                           min_train_days=wf["min_train_days"])
+    leaky = [
+        Split(
+            train_start=sp.train_start,
+            train_end=dates[int(dates.get_indexer([sp.valid_start])[0]) + contam],
+            valid_start=sp.valid_start, valid_end=sp.valid_end,
+            test_start=sp.test_start, test_end=sp.test_end,
+        )
+        for sp in base
+    ]
     lgb_params = dict(mcfg.models["lgb"])
     lgb_params.pop("num_boost_round", None)
     lgb_params.pop("early_stopping_rounds", None)
 
     vals = {}
-    for emb in (cfg.split["embargo_days"], 0):
-        splits = generate_splits(dates, "2022-01-01", "2024-01-01", retrain_months=12,
-                                 embargo_days=emb, valid_days=240,
-                                 min_train_days=mcfg.walkforward["min_train_days"])
-        res = run_walkforward(df, feat_cols, splits, model="lgb",
+    for tag, sps in (("干净", base), (f"train_end 侵入 valid {contam} 天", leaky)):
+        res = run_walkforward(df, feat_cols, sps, model="lgb",
                               lgb_params=lgb_params, verbose=False)
-        vals[emb] = float(res.log["best_valid_ic"].mean())
-        print(f"      embargo={emb} 天 → 验证集 IC {vals[emb]:.4f}")
+        vals[tag] = float(res.log["best_valid_ic"].mean())
+        print(f"      {tag} → 验证集 IC {vals[tag]:.4f}（{len(sps)} 个窗口）")
 
-    emb = cfg.split["embargo_days"]
-    check(f"去掉 embargo 后验证集 IC 虚高（{emb} 天 vs 0 天）",
-          vals[0] > vals[emb],
-          f"embargo={emb}: {vals[emb]:.4f}  →  embargo=0: {vals[0]:.4f}  "
-          f"（虚高 {(vals[0] - vals[emb]) / max(abs(vals[emb]), 1e-9):+.1%}）")
+    clean, dirty = vals["干净"], vals[f"train_end 侵入 valid {contam} 天"]
+    infl = (dirty - clean) / max(abs(clean), 1e-9)
+    check(
+        f"验证集 IC 对训练污染敏感（train_end 侵入 valid {contam} 天应虚高 >= +20%）",
+        infl >= 0.20,
+        f"干净 {clean:.4f} → 污染 {dirty:.4f}（虚高 {infl:+.1%}）"
+        + ("" if infl >= 0.20 else "。虚高不明显说明验证集 IC 看不见训练污染，"
+           "那 embargo 与早停的整套逻辑都要重查"),
+    )
 
 
 def main() -> int:
