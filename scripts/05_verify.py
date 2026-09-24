@@ -352,7 +352,7 @@ def verify_benchmark(cfg, mcfg, model: str = "lgb") -> None:
         `top300` 只是它的近似；测试期我们也用 2017-01→2020-08 对齐官方，但股票池不同。
       * 官方数字是 20 个随机种子的均值，我们只跑 1 个种子。
     """
-    print("\n[4] qlib 官方基准量级对照（top300 + 1 日标签 + Alpha158 默认 158 因子）")
+    print("\n[4] qlib 官方基准量级对照（top300 + 1 日标签 + Alpha158 默认 157 因子）")
     from pmsp.model.dataset import build_feature_matrix
     from pmsp.model.walkforward import generate_splits, run_walkforward
 
@@ -366,7 +366,13 @@ def verify_benchmark(cfg, mcfg, model: str = "lgb") -> None:
         windows=[5, 10, 20, 30, 60],  # 官方默认，158 个因子
         cache_dir=abs_path(mcfg.output["cache_dir"]),
     )
-    check("Alpha158 默认配置为 158 个因子", len(feat_cols) == 158, f"{len(feat_cols)} 个")
+    # 官方 Alpha158 是 158 个，我们必然少 1 个：新浪接口没有成交额 → 没有 $vwap →
+    # 拿不到 `VWAP0`（= $vwap/$close）。它出自 loader 的 price 组 windows=[0]，与
+    # 滚动窗口列表无关，所以主配置 216→215、这里 158→157，是同一个缺口。
+    check("Alpha158 默认配置为 157 个因子（官方 158 减去无 $vwap 的 VWAP0）",
+          len(feat_cols) == 157,
+          f"{len(feat_cols)} 个" + ("" if len(feat_cols) == 157 else "，与预期不符："
+          "若为 158 说明 $vwap 有了（该更新局限说明），其他值说明 loader 配置变了"))
 
     dates = pd.DatetimeIndex(df.index.get_level_values("datetime").unique()).sort_values()
     splits = generate_splits(dates, "2017-01-01", "2020-08-01", retrain_months=12,
