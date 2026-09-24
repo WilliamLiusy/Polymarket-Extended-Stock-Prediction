@@ -127,7 +127,12 @@ def quantile_backtest(
 
     ret_mat = ret_1d.dropna().unstack(level="instrument")
     calendar = pd.DatetimeIndex(sorted(ret_mat.index))
-    ret_mat = ret_mat.reindex(calendar).fillna(0.0)
+    ret_mat = ret_mat.reindex(calendar)
+    # 「当天不在池/无数据」与「当天收平」都会是 0，必须在填充**之前**留下掩码，
+    # 否则算等权基准时只能用 `!= 0` 区分，会把真实收平的日子也当成空缺剔除，
+    # 分母缩小 → 基准被系统性抬高（实测约 +1.2 个百分点/年）。
+    present = ret_mat.notna()
+    ret_mat = ret_mat.fillna(0.0)
 
     cost = cost or {}
     buy_bps = cost.get("commission_bps", 0.0) + cost.get("impact_bps", 0.0)
@@ -162,8 +167,14 @@ def quantile_backtest(
     # 多空组合的成本是两条腿**相加**：空头腿的调仓一样要付费。
     # 写成 net[hi] - net[lo] 会把空头腿的成本变成收益，使净值高于税前。
     ls_net = ls_gross - fees[hi] - fees[lo]
-    # 全市场等权基准，用于算 Top 组超额
-    eq_weight = ret_mat.where(ret_mat != 0.0).mean(axis=1).fillna(0.0)
+    # 全市场等权基准，用于算 Top 组超额。
+    # **必须和分层组用同一套执行口径**（T+1 买、T+6 卖、5 日重叠分批），否则比的
+    # 是两件事：基准每日全额再平衡，而组合每天只调 1/5 仓。口径不一致时，基准会
+    # 白拿一份再平衡收益，Top 组超额随之被系统性低估。
+    w_uni = present.astype(float)
+    w_uni = w_uni.div(w_uni.sum(axis=1).replace(0.0, np.nan), axis=0).fillna(0.0)
+    h_uni = _hold_from_target(w_uni, calendar, horizon=horizon)
+    eq_weight = (h_uni * ret_mat).sum(axis=1)
 
     return {
         "n_groups": n_groups,
@@ -178,6 +189,9 @@ def quantile_backtest(
             "gross": _perf_stats(gross[hi]),
             "net": _perf_stats(net[hi]),
             "excess_vs_eqw": _perf_stats(gross[hi] - eq_weight),
+            # 年换手 34 倍，税前超额没有决策意义。基准按惯例不计费（等权买入持有
+            # 的换手远低于组合），所以「税后组合 − 税前基准」就是可落地的超额。
+            "excess_vs_eqw_net": _perf_stats(net[hi] - eq_weight),
         },
         "avg_daily_turnover_one_way": float(turnover[hi].mean()),
         "daily": pd.DataFrame(

@@ -97,7 +97,8 @@ def report_window(
         ("多空（税后）", bt["long_short"]["net"]),
         ("Top 组（税前）", bt["top_group"]["gross"]),
         ("Top 组（税后）", bt["top_group"]["net"]),
-        ("Top 组超额 vs 全市场等权", bt["top_group"]["excess_vs_eqw"]),
+        ("Top 组超额 vs 全市场等权（税前）", bt["top_group"]["excess_vs_eqw"]),
+        ("**Top 组超额 vs 全市场等权（税后）**", bt["top_group"]["excess_vs_eqw_net"]),
     ]:
         lines.append(
             f"| {name} | {_fmt_pct(st['ann_return'])} | {_fmt_pct(st['ann_vol'])} | "
@@ -109,7 +110,11 @@ def report_window(
         f"年化约 {bt['avg_daily_turnover_one_way'] * 243:.0f} 倍。",
         "",
         "> 多空组合是**因子诊断工具，不是可实盘策略**：A 股融券券源少、成本高、"
-        "小盘股基本借不到。能落地的看「Top 组超额」那一行。",
+        "小盘股基本借不到。**能落地的只看「Top 组超额（税后）」那一行**——"
+        "年换手 34 倍，税前超额没有决策意义。",
+        "",
+        "> 等权基准与组合用**同一套执行口径**（T+1 买、T+6 卖、5 日重叠分批）。"
+        "若基准按每日全额再平衡算，它会白拿一份再平衡收益，超额被系统性低估。",
         "",
         "#### 成本敏感性",
         "",

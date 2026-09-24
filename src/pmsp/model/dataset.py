@@ -155,15 +155,47 @@ def build_feature_matrix(
 
 
 def daily_returns(qlib_dir: Path, universe: str, start_date: str, end_date: str) -> pd.Series:
-    """回测用的单日收益率序列（后复权 close 的 pct_change）。"""
+    """回测用的单日收益率序列（后复权 close 的单日变化）。
+
+    **两个坑，都会把回测基准做高，必须一起避开：**
+
+    1. **动态股票池的成分区间缺口。** 不能把 `D.instruments(universe)` 的结果再
+       `pct_change()`。动态池会让每只股票的序列按成分区间打断：某只 1 月在池、
+       2–6 月出池、7 月回池，过滤后的序列里 7 月首日紧挨着 1 月末日，`pct_change()`
+       于是把半年的涨幅记成一天。实测最大单股"日收益" **+779%**，且极端值全部
+       落在每月第一个交易日（调仓生效日）。回池的股票恰恰是因为涨上去了成交额
+       才重回前 1500，所以偏差是**系统性正向**的——全市场等权基准被抬高约 19 个
+       百分点/年。
+    2. **停牌缺口。** 改传静态代码列表能绕开第 1 点，但 qlib 只存实际有交易的
+       行，`Ref($close,1)` 指的是"上一条记录"而不是"上一个交易日"。停牌 400 天
+       复牌时它指回停牌前，同样把几个月记成一天（实测最大 **+2900%**）。
+
+    两者是同一个毛病：*上一条记录 ≠ 上一个交易日*。所以这里的做法是把价格矩阵
+    **对齐到交易日历**再求变化，只要前一个交易日没有价格就给 NaN——成分缺口和
+    停牌缺口一并消掉，不需要分别打补丁。`fill_method=None` 是必须的，pandas 默认
+    会 ffill，那等于用停牌前的价格假装当天有成交。
+
+    成分区间的过滤留给调用方（回测里与预测索引取交集即可），所以这里返回全部
+    代码、全部日期。
+    """
     from qlib.data import D
 
     ensure_qlib_init(qlib_dir)
-    close = D.features(
-        D.instruments(universe), ["$close"], start_time=start_date, end_time=end_date
-    )["$close"]
-    ret = close.groupby(level="instrument", group_keys=False).pct_change()
+    codes = D.list_instruments(
+        D.instruments(universe), start_time=start_date, end_time=end_date, as_list=True
+    )
+    px = D.features(list(codes), ["$close"], start_time=start_date, end_time=end_date)["$close"]
+    if list(px.index.names) == ["instrument", "datetime"]:
+        px = px.swaplevel(0, 1)
+    mat = px.sort_index().unstack(level="instrument")
+    calendar = pd.DatetimeIndex(D.calendar(start_time=start_date, end_time=end_date))
+    mat = mat.reindex(calendar.union(mat.index)).sort_index()
+    ret = mat.pct_change(fill_method=None)
     ret = ret.replace([np.inf, -np.inf], np.nan)
-    if list(ret.index.names) == ["instrument", "datetime"]:
-        ret = ret.swaplevel(0, 1).sort_index()
-    return ret.rename("ret_1d")
+    return (
+        ret.stack(future_stack=True)
+        .dropna()
+        .rename_axis(["datetime", "instrument"])
+        .sort_index()
+        .rename("ret_1d")
+    )

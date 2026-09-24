@@ -49,6 +49,12 @@ _results: list[tuple[str, bool, str]] = []
 
 
 def check(name: str, ok: bool | None, detail: str = "") -> None:
+    # `numpy.bool_(True) is True` 为 **False**，而汇总是用 `ok is True` / `ok is False`
+    # 计数的。numpy 比较（`a < b`、`x.empty` 之外的大多数表达式）返回 numpy.bool_，
+    # 于是失败项会打印 [失败] 却不计入 n_fail，退出码仍是 0——静默放过。
+    # 在入口统一归一化，调用方就不必逐个记得包 bool()。
+    if ok is not None:
+        ok = bool(ok)
     _results.append((name, ok, detail))
     mark = "[跳过]" if ok is None else ("[通过]" if ok else "[失败]")
     print(f"  {mark} {name}" + (f" — {detail}" if detail else ""))
@@ -216,6 +222,76 @@ def verify_from_predictions(cfg, mcfg, universe: str, model: str) -> None:
           + ("（差距过大 → Pearson IC 被少数极端收益个股主导）" if not (0.5 < ratio < 2.0) else ""))
 
 
+# --------------------------------------------- 7. 回测用单日收益没有缺口假收益
+def verify_ret1d_no_gap(cfg, mcfg, universe: str) -> None:
+    """单日收益序列里不能有"把几个月记成一天"的假收益。
+
+    这条是**回归检验**，对应一个真实踩过的坑：`ret1d` 曾经用
+    `D.features(D.instruments(universe), ["$close"])` 取完价格再 `pct_change()`。
+    动态股票池按成分区间打断序列、qlib 又只存实际有交易的行（停牌无行），于是
+    "上一条记录"并不是"上一个交易日"，跨缺口的 `pct_change` 把几个月的涨幅记成
+    一天。实测最大单股"日收益" +779%（成分缺口）/ +2900%（停牌缺口），极端值全
+    落在每月第一个交易日，且因为回池的股票多是涨上去的，偏差**系统性正向**，把
+    全市场等权基准抬高约 19 个百分点/年，Top 组超额随之被严重低估。
+
+    抓它的不变量：把全池等权的目标权重**整体推迟一天**，组合收益不应显著变化
+    （固定池子的等权组合平移一天还是等权组合）。有缺口假收益时，假收益只在
+    成分区间首日与权重对齐，推迟一天就对不上，收益会断崖式下跌。
+    """
+    print("\n[7] 回测用单日收益：无「缺口假收益」")
+    from pmsp.eval.backtest import _hold_from_target, as_panel
+
+    pred_dir = abs_path(mcfg.output["pred_dir"])
+    ret_path = pred_dir / f"ret1d_{universe}.parquet"
+    pred_path = pred_dir / f"pred_{universe}_lgb_baseline.parquet"
+    if not ret_path.exists() or not pred_path.exists():
+        check("单日收益无缺口假收益", None,
+              f"缺 {ret_path.name} 或 {pred_path.name}，先跑 scripts/03_run_workflow.py")
+        return
+
+    pred = as_panel(pd.read_parquet(pred_path)["score"])
+    ret1d = pd.read_parquet(ret_path)["ret_1d"]
+    ret1d = as_panel(ret1d.reindex(pred.index.intersection(ret1d.index)))
+
+    mat = ret1d.dropna().unstack(level="instrument")
+    cal = pd.DatetimeIndex(sorted(mat.index))
+    raw = mat.reindex(cal)
+    filled = raw.fillna(0.0)
+
+    # 1) 极端值计数。A 股主板 ±10%、创业板/科创板 ±20%，新股上市头 5 日与
+    #    北交所不设涨跌幅，所以允许少量 >50% 的真实值，但不该成千上万条。
+    n_big = int((ret1d.abs() > 0.5).sum())
+    check("单日收益 |ret|>50% 的条数在合理范围（<200）",
+          n_big < 200,
+          f"{n_big} 条，最大 {ret1d.max():.2f}／最小 {ret1d.min():.2f}"
+          + ("（缺口假收益的典型症状是成千上万条，且集中在每月首个交易日）"
+             if n_big >= 200 else ""))
+
+    # 2) 平移不变性：全池等权权重推迟一天，年化收益不应变化超过 5 个百分点
+    w = raw.notna().astype(float)
+    w = w.div(w.sum(axis=1).replace(0.0, np.nan), axis=0).fillna(0.0)
+    r0 = (_hold_from_target(w, cal, horizon=1, exec_lag=0) * filled).sum(axis=1)
+    r1 = (_hold_from_target(w, cal, horizon=1, exec_lag=1) * filled).sum(axis=1)
+    a0, a1 = r0.mean() * 243, r1.mean() * 243
+    check("全池等权的权重推迟一天，年化收益变化 <5 个百分点（无缺口假收益）",
+          abs(a0 - a1) < 0.05,
+          f"不推迟 {a0:.2%}，推迟一天 {a1:.2%}，差 {abs(a0 - a1) * 100:.2f} 个百分点")
+
+    # 3) 极端值不应集中在每月第一个交易日（调仓生效日）
+    first_days = set(pd.Series(cal).groupby([cal.year, cal.month]).min())
+    ext = ret1d[ret1d.abs() > 0.5]
+    if len(ext) >= 10:
+        on_first = ext.index.get_level_values("datetime").isin(first_days)
+        share = float(on_first.mean())
+        base = len(first_days) / len(cal)
+        check("极端收益未集中在每月首个交易日（调仓生效日）",
+              share < max(0.25, base * 4),
+              f"{share:.1%} 落在月初首日，基准占比 {base:.1%}")
+    else:
+        check("极端收益未集中在每月首个交易日（调仓生效日）", True,
+              f"极端值仅 {len(ext)} 条，不足以形成集中")
+
+
 # ----------------------------------------- 3a 标签直算核对 / 3b 截断一致性
 def verify_no_lookahead(cfg, mcfg, universe: str, n_check_stocks: int = 30) -> None:
     print("\n[3] 无前视：标签口径直算核对 + point-in-time 截断一致性")
@@ -360,8 +436,8 @@ def main() -> int:
     ap.add_argument("--model", default="lgb", choices=["lgb", "ridge"])
     ap.add_argument("--only", default="fast",
                     choices=["fast", "all", "adjust", "predictions", "lookahead",
-                             "benchmark", "embargo"],
-                    help="fast = 不联网不重训的项（3+2/6）；adjust 要联网；"
+                             "ret1d", "benchmark", "embargo"],
+                    help="fast = 不联网不重训的项（3+2/6+7）；adjust 要联网；"
                          "benchmark/embargo 要训练")
     args = ap.parse_args()
 
@@ -381,6 +457,8 @@ def main() -> int:
         verify_no_lookahead(cfg, mcfg, args.universe)
     if want in ("fast", "all", "predictions"):
         verify_from_predictions(cfg, mcfg, args.universe, args.model)
+    if want in ("fast", "all", "ret1d"):
+        verify_ret1d_no_gap(cfg, mcfg, args.universe)
     if want in ("all", "benchmark"):
         verify_benchmark(cfg, mcfg, args.model)
     if want in ("all", "embargo"):
