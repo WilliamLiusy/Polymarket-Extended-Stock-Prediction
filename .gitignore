@@ -5,8 +5,11 @@
 # data/qlib_cn/             qlib 二进制库
 # data/features/            特征矩阵缓存（215 因子 × 全市场 × 16 年）
 # data/predictions/         walk-forward 的样本外预测与日度 IC 序列
-# data/reports/             生成的 markdown 报告
 data/
+
+# 注意 `reports/`（仓库根，见 configs/model.yaml 的 output.report_dir）**进仓库**：
+# 它是研究结论本身的记录，几 KB 的 markdown，值得随代码一起版本化。
+# 重跑 04_report.py 会改动它，这是预期的——数字变了就该在 diff 里看见。
 
 # 环境与缓存
 __pycache__/
