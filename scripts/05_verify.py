@@ -72,8 +72,14 @@ def verify_adjust_internal(cfg) -> None:
     下面三条合起来其实比"和某家对一遍"更有力，因为它们直接检验复权**要
     干的事**——把除权造成的价格跳空移走，且只移走这个：
 
-    * **因子形状**：后复权累计因子必须 ≥ 1 且**非递减**。分红送股只会让它
-      上台阶，绝不会下降。若出现下降，说明因子序列取反了或对齐错了。
+    * **因子形状**：后复权累计因子必须恒为正。**不能卡"非递减"**——分红送股
+      只会让它上台阶，但**缩股**（破产重整里的出资人权益调整）会让它合法地
+      下降：股数变少、单价机械性跳涨，后复权必须把后面的价格乘回去。
+      全市场实测只有 2 只出现过：SH600381（未复权价跨 440 天停牌 2.08→17.59
+      即 ×8.46，因子 8.193→1.0175 即 ×1/8.05）和 SZ200054（×4.20 / ×1/4.00），
+      两只复牌当天复权后收益都恰好 +5.0%——它们是 ST，当年涨跌停正是 5%。
+      所以改成卡**下降当日复权后收益必须落在涨跌停带内**：因子若取反或对齐
+      错了，抵消不成立，那天会出现一个几百个百分点的荒谬收益。
     * **除权日跳空**：在因子变化日上，**未复权**收益应显著为负（除权除息
       当天价格机械性下跌），复权应把这个跳空**抹掉绝大部分**。
       看的是**抹掉的比例**而不是残差的绝对水平：残差里含真实的贴权漂移
@@ -88,20 +94,25 @@ def verify_adjust_internal(cfg) -> None:
     panel = panel.sort_values(["code", "date"], ignore_index=True)
     g = panel.groupby("code", sort=False)
 
-    # --- 1a 因子形状
-    f_min = g["factor"].min()
-    dec = g["factor"].apply(lambda s: float(s.diff().min()))
-    n_dec = int((dec < -1e-9).sum())
-    check("后复权因子 ≥ 1 且非递减（分红送股只会让它上台阶）",
-          bool(f_min.min() >= 1.0 - 1e-9 and n_dec == 0),
-          f"最小因子 {f_min.min():.6f}，{n_dec} 只出现过因子下降（应为 0）")
-
     # 未复权价 = 复权价 / 因子。两条收益率序列的差别应**只**来自除权日
     raw_close = panel["close"] / panel["factor"]
     ret_adj = g["close"].pct_change()
     ret_raw = raw_close.groupby(panel["code"], sort=False).pct_change()
     is_exdiv = g["factor"].pct_change().abs() > 1e-9
     ok = ret_adj.notna() & ret_raw.notna()
+
+    # --- 1a 因子形状：恒为正，且因子下降（缩股）当日复权后收益不荒谬
+    f_min = g["factor"].min()
+    f_chg = g["factor"].diff()
+    shrink = ok & (f_chg < -1e-9)          # 缩股日
+    n_shrink = int(shrink.sum())
+    # 0.11 = 主板 10% 涨跌停留一点余量；复牌日、创业板 20% 也都在 0.25 以内
+    worst = float(ret_adj[shrink].abs().max()) if n_shrink else 0.0
+    check("复权因子恒为正；缩股日的跳涨被因子下降精确抵消（复权后收益不荒谬）",
+          bool(f_min.min() > 0 and n_shrink <= 20 and worst < 0.25),
+          f"最小因子 {f_min.min():.6f}，{n_shrink} 个缩股日，"
+          f"复权后 |收益| 最大 {worst:.2%}（未复权那天是 "
+          f"{float(ret_raw[shrink].abs().max()) if n_shrink else 0:.0%}）")
 
     # --- 1b 除权日跳空
     ex = ok & is_exdiv
@@ -142,10 +153,17 @@ def verify_adjust_external(cfg, n_stocks: int = 3) -> None:
     cands = _high_dividend_codes(panel, n_stocks)
     ds = EastmoneyDaily()
     for code in cands.index:
-        ours = panel[panel["code"] == code][["date", "close"]].set_index("date")["close"]
+        # compare_adjustment 收的是 DataFrame（自己认 date / trade_date 列），不是 Series
+        ours = panel[panel["code"] == code][["date", "close"]].sort_values("date")
         ts_code = f"{code[2:]}.{code[:2]}"
         try:
-            ref = ds.fetch_one_symbol(ts_code, adjust=2)
+            # 起止日期跟我们自己的面板对齐；东财这个签名要求显式传，不能省
+            ref = ds.fetch_one_symbol(
+                ts_code,
+                start_date=f"{ours['date'].min():%Y%m%d}",
+                end_date=f"{ours['date'].max():%Y%m%d}",
+                adjust=2,
+            )
         except Exception as exc:
             check(f"{code} 复权交叉校验", None, f"东财取数失败：{exc}")
             time.sleep(8)
@@ -154,7 +172,7 @@ def verify_adjust_external(cfg, n_stocks: int = 3) -> None:
             check(f"{code} 复权交叉校验", None, "东财返回空（限流）")
             time.sleep(8)
             continue
-        cmp = compare_adjustment(ours, ref.set_index("date")["close"])
+        cmp = compare_adjustment(ours, ref)
         check(f"{code} 复权后收益率序列与东财一致",
               cmp["ret_corr"] > 0.999 and cmp["n_overlap"] > 200,
               f"重叠 {cmp['n_overlap']} 日，收益率相关 {cmp['ret_corr']:.6f}，"
