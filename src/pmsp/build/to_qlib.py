@@ -1,7 +1,9 @@
 """面板 -> qlib 二进制格式。
 
-qlib 官方 A 股数据包挂在 GitHub Releases，本机 github.com 不通，所以自己灌。
-自己灌反而更好：能覆盖到 2026-09、能自己控制退市股与复权口径，官方快照给不了。
+qlib 官方 A 股数据包挂在 GitHub Releases。2026-09-28 复测：**能下**（约 40 分钟），
+但下来了也用不了——日历止于 2022-12-30，字段和新浪一样没有 amount/vwap，
+Polymarket 对比窗口（2025-01→2026-09）完全没覆盖。所以仍然自己灌：能覆盖到
+2026-09、能自己控制退市股与复权口径。详见 `pmsp.datasource.qlib_official`。
 
 转换靠官方 `scripts/dump_bin.py`（已放在 `third_party/`，wheel 里不含此文件）。
 它的三条约定必须对齐，错一条就查半天：

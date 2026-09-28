@@ -31,6 +31,34 @@ source:
   #   2. $vwap 不可得 → Alpha158 的 VWAP0 因子去掉，因子数 216 → 215
   has_amount: false
 
+# ---------------------------------------------------------------- 补充 / 参照数据源
+#
+# 这两段都**不参与 baseline 主流程**。baseline 的数字（README 那张表）只由
+# 新浪源 + data/qlib_cn 决定，改这里不会让它变。它们的用途是：
+#   (a) 补齐新浪拿不到的字段（成交额/vwap/ST/停牌/流通市值/真实指数成分）；
+#   (b) 给复权正确性一个**外部**参照（原先只有自洽检验，外部源都打不通）。
+# 实测结论见 README「数据源盘点」。
+
+# qlib 官方数据包（GitHub Releases，Yahoo 口径）。只当参照集：
+# 日历止于 2022-12-30、成分止于 2020-09，且同样没有 amount/vwap，补不了任何局限。
+reference:
+  qlib_official_dir: "data/qlib_official"   # 解包后的 qlib 目录
+  download_dir: "data/reference"            # zip 与元数据缓存
+  asset: cn_1d                              # cn_1d(240MB) / cn_1d_simple(52MB) / us_1d
+
+# baostock（免费、无 token、无注册）。补字段用，不替换主源。
+# 不含北交所（bj.* 一律报错），BJ 股票没有补充字段，这是已知缺口。
+supplement:
+  source: baostock
+  by_symbol_dir: "data/raw/baostock_by_symbol"  # 每股一个 parquet（可断点续传）
+  workers: 3                    # 并行进程数。必须是独立进程：baostock 的全局 socket
+                                # 在 fork 出的子进程里会挂死（实测 12 只跑 12 分钟无输出）。
+                                # **别往上调**：实测 8 进程跑 2.5 分钟就被
+                                # `10001011 黑名单用户` 拉黑（账号级，重试无用，
+                                # 连单进程都登不进去），80 只里 22 只直接失败。
+  rate_limit_per_min: 240       # 官方未公布上限。600 + 8 进程被拉黑过，降到这里保守些
+  indexes: [hs300, zz500]       # 要生成 instruments 文件的指数
+
 universe:
   rebalance: month_end          # 每月最后一个交易日调整
   lookback_days: 60             # 按过去 60 个交易日的日均成交额排名

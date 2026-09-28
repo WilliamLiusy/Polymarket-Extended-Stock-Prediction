@@ -27,5 +27,8 @@ pyarrow==25.0.1    # parquet 读写
 
 tushare==1.4.29    # 主数据源（免费档 120 积分，只用 daily 接口）
 requests==2.34.2   # 备用源（东方财富）
+baostock==0.9.4    # 补充源：amount/vwap/isST/tradestatus/指数成分历史，免费无 token
+                   # 注意它的 ResultData.get_data() 在 pandas>=2 上会崩（内部用了
+                   # 已被删除的 DataFrame.append），本项目一律自己逐行 next()
 PyYAML==6.0.3
 tqdm==4.70.1

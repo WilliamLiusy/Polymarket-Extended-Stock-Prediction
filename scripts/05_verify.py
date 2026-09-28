@@ -3,6 +3,7 @@
 
     python scripts/05_verify.py                 # 跑不需要网络、不需要重训的项（1,3,2/6）
     python scripts/05_verify.py --only adjust   # 复权自洽检验 + 外部交叉校验（后者要联网）
+    python scripts/05_verify.py --only crosssource  # 只跑 baostock 外部交叉校验（约 1 分钟）
     python scripts/05_verify.py --only benchmark  # qlib 官方基准量级对照（要训练，约几十分钟）
     python scripts/05_verify.py --only embargo    # embargo 有效性（要训练两次）
 
@@ -184,6 +185,56 @@ def verify_adjust_external(cfg, n_stocks: int = 3) -> None:
               f"重叠 {cmp['n_overlap']} 日，收益率相关 {cmp['ret_corr']:.6f}，"
               f"单日最大偏差 {cmp['max_abs_ret_diff']:.2e}")
         time.sleep(8)  # 东财连发约 6 次即封 IP，必须慢
+
+
+def verify_adjust_crosssource(cfg, n_stocks: int = 5) -> None:
+    """复权交叉校验（baostock）。这是**真正能跑通的**那个外部源。
+
+    东财那条（`verify_adjust_external`）实测连发约 6 次就封 IP，几乎总是"跳过"，
+    等于没有外部校验。baostock 免费、无 token、不限流，且口径独立（它自己算后复权），
+    所以这条才是可以当门禁用的：相关 >0.999 才算通过，取不到数才跳过。
+
+    注意也不能反过来盲信外部源：qlib 官方数据包在 SZ002455 2018-03-08 报 +177.3%，
+    而我们和 baostock 都是 −0.34%——外部源自己也会错，要三方仲裁才能定谁错。
+    """
+    print("\n[1''] 复权交叉校验（baostock，取不到则跳过）")
+    try:
+        from pmsp.datasource.baostock_daily import BaostockDaily, is_supported
+    except ImportError as exc:
+        check("baostock 复权交叉校验", None, f"未安装 baostock：{exc}")
+        return
+
+    panel = pd.read_parquet(cfg.path("data.panel_path"))
+    cands = [c for c in _high_dividend_codes(panel, n_stocks * 2).index if is_supported(c)]
+    if not cands:
+        check("baostock 复权交叉校验", None, "候选股票全是 baostock 不支持的（北交所）")
+        return
+    try:
+        ds = BaostockDaily()
+        ds.login()
+    except Exception as exc:  # noqa: BLE001  登录失败只应导致跳过，不该让整轮验证失败
+        check("baostock 复权交叉校验", None, f"登录失败：{exc}")
+        return
+    try:
+        for code in cands[:n_stocks]:
+            ours = panel[panel["code"] == code][["date", "close"]].sort_values("date")
+            try:
+                ref = ds.fetch_adjusted_close(
+                    code, f"{ours['date'].min():%Y-%m-%d}", f"{ours['date'].max():%Y-%m-%d}"
+                )
+            except Exception as exc:  # noqa: BLE001
+                check(f"{code} 复权交叉校验（baostock）", None, f"取数失败：{exc}")
+                continue
+            if ref.empty:
+                check(f"{code} 复权交叉校验（baostock）", None, "返回空")
+                continue
+            cmp = compare_adjustment(ours, ref)
+            check(f"{code} 复权后收益率序列与 baostock 一致",
+                  cmp["ret_corr"] > 0.999 and cmp["n_overlap"] > 200,
+                  f"重叠 {cmp['n_overlap']} 日，收益率相关 {cmp['ret_corr']:.6f}，"
+                  f"单日最大偏差 {cmp['max_abs_ret_diff']:.2e}")
+    finally:
+        ds.logout()
 
 
 # --------------------------------------------------- 2. 随机因子 & 6. IC/RankIC
@@ -511,9 +562,9 @@ def main() -> int:
     ap.add_argument("--universe", default=f"top{cfg.universe['top_n_list'][0]}")
     ap.add_argument("--model", default="lgb", choices=["lgb", "ridge"])
     ap.add_argument("--only", default="fast",
-                    choices=["fast", "all", "adjust", "predictions", "lookahead",
-                             "ret1d", "benchmark", "embargo"],
-                    help="fast = 不联网不重训的项（3+2/6+7）；adjust 要联网；"
+                    choices=["fast", "all", "adjust", "crosssource", "predictions",
+                             "lookahead", "ret1d", "benchmark", "embargo"],
+                    help="fast = 不联网不重训的项（3+2/6+7）；adjust/crosssource 要联网；"
                          "benchmark/embargo 要训练")
     args = ap.parse_args()
 
@@ -529,6 +580,8 @@ def main() -> int:
         verify_adjust_internal(cfg)
     if want in ("all", "adjust"):
         verify_adjust_external(cfg)
+    if want in ("all", "adjust", "crosssource"):
+        verify_adjust_crosssource(cfg)
     if want in ("fast", "all", "lookahead"):
         verify_no_lookahead(cfg, mcfg, args.universe)
     if want in ("fast", "all", "predictions"):
